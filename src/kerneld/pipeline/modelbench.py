@@ -6,10 +6,22 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from kerneld.ops.registry import OpHandler, get_op_handler, validate_op_spec
 from kerneld.pipeline.candidates import load_candidate_info
 from kerneld.pipeline.integrator import patch_model
 from kerneld.run_state import RunState
-from kerneld.schemas import ModelbenchResult, RMSNormOpSpec
+from kerneld.schemas import ModelbenchResult, OpSpec
+
+_MODEL_OUTPUT_REL_DENOM_MIN = 1e-3
+_DEFAULT_MODEL_INPUT_SEED = 0
+_MODEL_OUTPUT_TOLERANCES = {
+    "float32": (1e-4, 1e-5),
+    "fp32": (1e-4, 1e-5),
+    "float16": (5e-1, 5e-2),
+    "fp16": (5e-1, 5e-2),
+    "bfloat16": (5e-1, 5e-2),
+    "bf16": (5e-1, 5e-2),
+}
 
 
 def modelbench_run(
@@ -18,6 +30,7 @@ def modelbench_run(
     candidate_id: str,
     warmup_iters: int = 5,
     measured_iters: int = 20,
+    input_seed: int = _DEFAULT_MODEL_INPUT_SEED,
 ) -> ModelbenchResult:
     state = RunState.load(run_dir)
     if state.config is None:
@@ -26,9 +39,7 @@ def modelbench_run(
         return result
     try:
         spec_payload = state.read_json("op_spec.json")
-        if spec_payload.get("op_type") != "rmsnorm":
-            raise ValueError(f"unsupported op spec type: {spec_payload.get('op_type')!r}")
-        spec = RMSNormOpSpec.model_validate(spec_payload)
+        handler, spec = validate_op_spec(spec_payload)
         candidate = load_candidate_info(state, candidate_id)
         result = _benchmark_model_pair(
             model_id=state.config.model_id,
@@ -36,10 +47,12 @@ def modelbench_run(
             dtype_label=state.config.dtype,
             device_label=state.config.device,
             spec=spec,
+            handler=handler,
             candidate=candidate,
             candidate_id=candidate_id,
             warmup_iters=warmup_iters,
             measured_iters=measured_iters,
+            input_seed=input_seed,
         )
     except Exception as exc:
         result = ModelbenchResult(
@@ -47,6 +60,7 @@ def modelbench_run(
             passed=False,
             warmup_iters=warmup_iters,
             measured_iters=measured_iters,
+            metadata={"input_seed": input_seed},
             error=str(exc),
         )
     state.write_json(f"modelbench/{candidate_id}.json", result)
@@ -59,12 +73,16 @@ def _benchmark_model_pair(
     input_shape: tuple[int, ...],
     dtype_label: str,
     device_label: str,
-    spec: RMSNormOpSpec,
-    candidate,
+    spec: OpSpec,
+    handler: OpHandler | None = None,
+    candidate=None,
     candidate_id: str,
     warmup_iters: int,
     measured_iters: int,
+    input_seed: int = _DEFAULT_MODEL_INPUT_SEED,
 ) -> ModelbenchResult:
+    if handler is None:
+        handler = get_op_handler(spec.op_type)
     torch = _import_torch()
     transformers = _import_transformers()
     device = _resolve_device(torch, device_label)
@@ -73,13 +91,13 @@ def _benchmark_model_pair(
     baseline_logits = None
 
     baseline_model = _load_model(transformers, model_id, dtype, device)
-    input_ids = _make_input_ids(torch, baseline_model, input_shape, device)
+    input_ids = _make_input_ids(torch, baseline_model, input_shape, device, input_seed=input_seed)
     with torch.no_grad():
         baseline_logits = baseline_model(input_ids=input_ids).logits.detach().float().cpu()
     baseline_ms = _time_forward(
         torch,
         device,
-        lambda: baseline_model(input_ids=input_ids),
+        lambda model=baseline_model: model(input_ids=input_ids),
         warmup_iters=warmup_iters,
         measured_iters=measured_iters,
     )
@@ -88,54 +106,100 @@ def _benchmark_model_pair(
 
     patched_model = _load_model(transformers, model_id, dtype, device)
     patch_result = patch_model(patched_model, spec, candidate, scope="compatible")
+    patch_metadata = _patch_metadata(handler, spec, patch_result)
     with torch.no_grad():
         patched_logits_tensor = patched_model(input_ids=input_ids).logits.detach().float().cpu()
     patched_ms = _time_forward(
         torch,
         device,
-        lambda: patched_model(input_ids=input_ids),
+        lambda model=patched_model: model(input_ids=input_ids),
         warmup_iters=warmup_iters,
         measured_iters=measured_iters,
     )
-    max_abs = (patched_logits_tensor - baseline_logits).abs().max().item()
-    max_rel = ((patched_logits_tensor - baseline_logits).abs() / baseline_logits.abs().clamp_min(1e-8)).max().item()
+    output_metrics = _model_output_metrics(torch, baseline_logits, patched_logits_tensor)
+    max_abs_tol, mean_abs_tol = _model_output_tolerances(dtype_label)
+    output_passed = bool(
+        output_metrics["max_abs_error"] <= max_abs_tol
+        and output_metrics["mean_abs_error"] <= mean_abs_tol
+        and output_metrics["argmax_match"]
+    )
     speedup_pct = ((baseline_ms - patched_ms) / baseline_ms) * 100.0 if baseline_ms > 0 else None
     del patched_model
     _cleanup(torch, device)
 
+    error = None
+    if not output_passed:
+        error = (
+            "model output drift exceeded tolerance: "
+            f"max_abs={output_metrics['max_abs_error']:.6g} <= {max_abs_tol:.6g}, "
+            f"mean_abs={output_metrics['mean_abs_error']:.6g} <= {mean_abs_tol:.6g}, "
+            f"argmax_match={output_metrics['argmax_match']}"
+        )
+
     return ModelbenchResult(
         candidate_id=candidate_id,
-        passed=True,
+        passed=output_passed,
         baseline_ms=baseline_ms,
         patched_ms=patched_ms,
         speedup_pct=speedup_pct,
         warmup_iters=warmup_iters,
         measured_iters=measured_iters,
-        output_max_abs_error=float(max_abs),
-        output_max_rel_error=float(max_rel),
+        output_max_abs_error=float(output_metrics["max_abs_error"]),
+        output_mean_abs_error=float(output_metrics["mean_abs_error"]),
+        output_max_rel_error=float(output_metrics["max_rel_error"]),
+        output_argmax_match=bool(output_metrics["argmax_match"]),
         metadata={
             "model_id": model_id,
             "input_shape": list(input_shape),
+            "input_seed": input_seed,
             "dtype": dtype_label,
             "device": device_label,
-            "module_path": spec.module_path,
-            "patch_scope": patch_result.patch_scope,
-            "patched_module_paths": patch_result.patched_module_paths,
-            "num_patched_modules": len(patch_result.patched_module_paths),
-            "skipped_modules": [
-                {"module_path": decision.module_path, "reason": decision.reason}
-                for decision in patch_result.skipped_modules
-            ],
+            "output_max_abs_tolerance": max_abs_tol,
+            "output_mean_abs_tolerance": mean_abs_tol,
+            "output_rel_denominator_min": _MODEL_OUTPUT_REL_DENOM_MIN,
+            **patch_metadata,
         },
+        error=error,
     )
+
+
+def _patch_metadata(handler: OpHandler, spec: OpSpec, patch_result: Any) -> dict[str, Any]:
+    if handler.patch_metadata is None:
+        return {"patch_scope": getattr(patch_result, "patch_scope", "unknown")}
+    return handler.patch_metadata(spec, patch_result)
+
+
+def _model_output_metrics(torch: Any, baseline_logits: Any, patched_logits: Any) -> dict[str, float | bool]:
+    diff = (patched_logits - baseline_logits).abs()
+    denom = torch.maximum(baseline_logits.abs(), patched_logits.abs()).clamp_min(_MODEL_OUTPUT_REL_DENOM_MIN)
+    baseline_next_token = baseline_logits[:, -1, :].argmax(dim=-1)
+    patched_next_token = patched_logits[:, -1, :].argmax(dim=-1)
+    return {
+        "max_abs_error": float(diff.max().item()),
+        "mean_abs_error": float(diff.mean().item()),
+        "max_rel_error": float((diff / denom).max().item()),
+        "argmax_match": bool(torch.equal(baseline_next_token, patched_next_token)),
+    }
+
+
+def _model_output_tolerances(dtype_label: str) -> tuple[float, float]:
+    return _MODEL_OUTPUT_TOLERANCES.get(dtype_label.lower(), (1e-4, 1e-5))
 
 
 def _load_model(transformers: Any, model_id: str, dtype: Any, device: Any):
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
+    if "Qwen3.5" in model_id:
+        model = transformers.AutoModelForMultimodalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=True,
+        )
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=dtype,
+            trust_remote_code=True,
+        )
+
     model.to(device)
     model.eval()
     return model
@@ -171,7 +235,14 @@ def _time_forward(torch: Any, device: Any, fn: Callable[[], Any], *, warmup_iter
         return float(statistics.median(timings))
 
 
-def _make_input_ids(torch: Any, model: Any, input_shape: tuple[int, ...], device: Any):
+def _make_input_ids(
+    torch: Any,
+    model: Any,
+    input_shape: tuple[int, ...],
+    device: Any,
+    *,
+    input_seed: int = _DEFAULT_MODEL_INPUT_SEED,
+):
     if len(input_shape) == 1:
         batch_size, seq_len = 1, input_shape[0]
     elif len(input_shape) >= 2:
@@ -179,7 +250,10 @@ def _make_input_ids(torch: Any, model: Any, input_shape: tuple[int, ...], device
     else:
         raise ValueError("input_shape must contain at least a sequence length")
     vocab_size = int(getattr(model.config, "vocab_size", 32000))
-    return torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(input_seed)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=generator, device="cpu")
+    return input_ids.to(device)
 
 
 def _resolve_device(torch: Any, requested: str):
