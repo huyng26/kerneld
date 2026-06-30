@@ -17,9 +17,9 @@ def _rmsnorm_kernel(x_ptr, weight_ptr, y_ptr, n_cols: tl.constexpr, eps: tl.cons
     offsets = tl.arange(0, block_size)
     mask = offsets < n_cols
     x = tl.load(x_ptr + row_idx * n_cols + offsets, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
     variance = tl.sum(x * x, axis=0) / n_cols
-    y = x * tl.rsqrt(variance + eps) * weight
+    y = (x * tl.rsqrt(variance + eps)).to($output_dtype) * weight
     tl.store(y_ptr + row_idx * n_cols + offsets, y, mask=mask)
 
 

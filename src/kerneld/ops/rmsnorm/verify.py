@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import math
 from typing import Any, Callable
 
 from kerneld.ops.rmsnorm.reference import rmsnorm_ref
 from kerneld.schemas import RMSNormOpSpec, VerificationResult
+
+_REL_ERROR_DENOM_MIN = 1e-3
 
 
 def verify_candidate_fn(
@@ -33,7 +34,7 @@ def verify_candidate_fn(
                 raise AssertionError(f"dtype mismatch: expected {expected.dtype}, got {actual.dtype}")
             torch.cuda.synchronize() if str(device).startswith("cuda") else None
             abs_error = (actual - expected).abs().max().item()
-            rel_error = ((actual - expected).abs() / expected.abs().clamp_min(1e-8)).max().item()
+            rel_error = _stable_relative_error(torch, actual, expected)
             passed = bool(torch.allclose(actual, expected, atol=atol, rtol=rtol))
             cases.append(
                 {
@@ -68,6 +69,11 @@ def verify_candidate_fn(
         )
     except Exception as exc:
         return VerificationResult(candidate_id=candidate_id, passed=False, error=str(exc))
+
+
+def _stable_relative_error(torch: Any, actual: Any, expected: Any) -> float:
+    denom = torch.maximum(actual.abs(), expected.abs()).clamp_min(_REL_ERROR_DENOM_MIN)
+    return float(((actual - expected).abs() / denom).max().item())
 
 
 def _verification_shapes(input_shape: tuple[int, ...], hidden_size: int) -> list[tuple[int, ...]]:
