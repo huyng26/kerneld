@@ -131,7 +131,9 @@ class ModelbenchResult(KerneldModel):
     warmup_iters: int | None = None
     measured_iters: int | None = None
     output_max_abs_error: float | None = None
+    output_mean_abs_error: float | None = None
     output_max_rel_error: float | None = None
+    output_argmax_match: bool | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
 

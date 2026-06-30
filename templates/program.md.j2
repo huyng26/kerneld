@@ -1,0 +1,134 @@
+# Kerneld Kernel Optimization Program
+
+You are an interactive coding agent optimizing one kernel candidate for this run. This file gives the run-specific context. The permanent rules are in `$contract_path` and must be followed.
+
+## Mission
+
+Improve the editable candidate kernel while preserving correctness and real-model behavior. Continue until the patched model is at least 2x faster than the baseline model, or until more than 50 trials have been attempted.
+
+The primary success metric is full-model speedup after patching the real model path. Standalone microbenchmark speed is useful only as a gate toward modelbench. Treat 2x full-model performance as the target for this run.
+
+## Run Context
+
+- Run ID: `$run_id`
+- Run directory: `$run_dir`
+- Model: `$model_id`
+- Op: `$op`
+- Input shape: `$input_shape`
+- Dtype/device: `$dtype` / `$device`
+- Minimum model speedup: `$min_model_speedup_pct%`
+- Op spec: `$op_spec_path`
+- Contract: `$contract_path`
+
+$op_summary
+
+## Editable File
+
+Edit exactly one file:
+
+```text
+$editable_candidate_path
+```
+
+Do not edit any other file. In particular, do not edit `program.md`, `agent_task.json`, `AGENT_CONTRACT.md`, `candidates.json`, numbered candidate snapshots, result JSON, report files, verifier code, benchmark code, model patchers, selectors, schemas, or pipeline infrastructure.
+
+If a non-candidate change appears necessary, stop and report the needed infrastructure change.
+
+## Starting Point
+
+- Starting candidate: `$selected_starting_candidate`
+- Current best: $current_best
+
+Read the editable file before changing it. Preserve the public candidate entrypoint and call signature.
+
+## Main Iteration Command
+
+After each focused edit to the editable file, run:
+
+```text
+$agent_step_command
+```
+
+`agent-step` snapshots the current editable file into a numbered candidate, runs the trusted evaluator sequence, and writes fresh feedback. Do not manually create snapshots or edit result artifacts.
+
+After `agent-step`, read:
+
+```text
+$agent_feedback_path
+```
+
+Use that feedback to decide the next edit.
+
+## Low-Level Reproduce Commands
+
+These commands are for inspection and reproducing numbered candidates only. Prefer `agent-step` during the optimization loop.
+
+```text
+$verify_command
+$microbench_command
+$modelbench_command
+$select_command
+$report_command
+```
+
+Replace `<candidate_id>` with a numbered candidate id such as `candidate_007`.
+
+## Optimization Loop
+
+Repeat this loop until full-model performance reaches at least 2x baseline performance, or until the trial count is larger than 50:
+
+1. Inspect `candidates/current.py`, `agent_feedback.md` if present, and relevant result JSON.
+2. Make one small, explainable change to `candidates/current.py`.
+3. Run `$agent_step_command`.
+4. Read `$agent_feedback_path`.
+5. Keep changes that improve correctness or performance signals; revise or undo changes that regress them.
+
+Do not batch many unrelated kernel changes in one attempt. The evaluator feedback is most useful when each attempt changes one idea.
+
+## Correctness Requirements
+
+The candidate must preserve:
+
+- `kernel_fn` public signature
+- RMSNorm semantics
+- output shape
+- output dtype
+- required masks for target and nearby shapes
+- verifier tolerances
+- compatibility with the patched model path
+
+A faster incorrect kernel is rejected.
+
+## Optimization Ideas
+
+Consider these only inside the editable candidate file:
+
+- block size and next-power-of-two choices
+- number of warps
+- launch grid and constexpr parameters
+- load/store masking
+- memory access pattern
+- fp32 accumulation versus lower precision where semantics permit
+- reducing redundant loads or conversions
+- specializing for hidden size and dtype from the op spec
+
+Prefer simple, auditable Triton changes. Do not hardcode outputs or benchmark-specific shortcuts.
+
+## Acceptance Criteria
+
+- Verification must pass.
+- Microbenchmark candidate latency must be lower than baseline latency.
+- Full-model benchmark performance must be at least 2x baseline performance.
+- Selector chooses the best accepted candidate using full-model speedup first and microbenchmark speedup as tie-breaker.
+
+## Stop Conditions
+
+- Stop when full-model performance reaches at least 2x baseline performance.
+- Stop when the number of trials is larger than 50.
+- Stop after `$repeated_correctness_failures` repeated correctness failures.
+- Stop if the editable candidate file is missing.
+- Stop if several attempts do not improve microbenchmark or modelbench results.
+- Stop if progress requires editing trusted infrastructure.
+- Stop if the next change would be speculative and not guided by feedback.
+
+When stopping, report the best candidate id, the best observed metrics, and why you stopped.
